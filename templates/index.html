@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>RFID Monitoring Dashboard</title>
+
+    <link rel="stylesheet"
+          href="{{ url_for('static', filename='style.css') }}">
+</head>
+
+<body>
+
+    <div class="app-container">
+
+        <!-- SIDEBAR -->
+
+        <aside class="sidebar">
+
+            <div class="brand">
+                <div class="brand-icon">RF</div>
+
+                <div>
+                    <h2>RFID SYSTEM</h2>
+                    <p>Monitoring Platform</p>
+                </div>
+            </div>
+
+            <nav class="navigation">
+
+                <a href="/" class="nav-link active">
+                    <span>▦</span>
+                    Dashboard
+                </a>
+
+                <a href="#card-management" class="nav-link">
+                    <span>▣</span>
+                     Card Management
+                </a>
+
+                <a href="#scan-history" class="nav-link">
+                    <span>▤</span>
+                    Scan History
+                </a>
+
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="system-indicator"></div>
+
+                <div>
+                    <strong>ESP32 Connected</strong>
+                    <small>RFID Monitoring System</small>
+                </div>
+            </div>
+
+        </aside>
+
+
+        <!-- MAIN CONTENT -->
+
+        <main class="main-content">
+
+            <!-- HEADER -->
+
+            <header class="topbar">
+
+                <div>
+                    <h1>Dashboard</h1>
+                    <p>Monitor and manage RFID card activity.</p>
+                </div>
+
+                <div class="topbar-right">
+
+                    <div class="api-status" id="api-status">
+                        <span class="status-dot"></span>
+                        Checking connection...
+                    </div>
+
+                    <button class="refresh-button"
+                            onclick="refreshDashboard()">
+                        Refresh
+                    </button>
+
+                </div>
+
+            </header>
+
+
+            <!-- WELCOME SECTION -->
+
+            <section class="welcome-section">
+
+                <div>
+                    <h2>RFID Monitoring Overview</h2>
+
+                    <p>
+                        Track authorized and unauthorized RFID card
+                        scans through your ESP32 device.
+                    </p>
+                </div>
+
+                <div class="date-display" id="current-date">
+                    --
+                </div>
+
+            </section>
+
+
+            <!-- STATISTICS CARDS -->
+
+            <section class="statistics-grid">
+
+                <div class="stat-card total-card">
+
+                    <div class="stat-top">
+                        <span class="stat-label">Total Scans</span>
+                        <span class="stat-icon">▤</span>
+                    </div>
+
+                    <h2 id="total-scans">0</h2>
+
+                    <p>All recorded RFID scans</p>
+
+                </div>
+
+
+                <div class="stat-card authorized-card">
+
+                    <div class="stat-top">
+                        <span class="stat-label">
+                            Authorized Scans
+                        </span>
+
+                        <span class="stat-icon">✓</span>
+                    </div>
+
+                    <h2 id="authorized-scans">0</h2>
+
+                    <p>Access granted</p>
+
+                </div>
+
+
+                <div class="stat-card unauthorized-card">
+
+                    <div class="stat-top">
+                        <span class="stat-label">
+                            Unauthorized Scans
+                        </span>
+
+                        <span class="stat-icon">!</span>
+                    </div>
+
+                    <h2 id="unauthorized-scans">0</h2>
+
+                    <p>Access denied</p>
+
+                </div>
+
+            </section>
+
+
+            <!-- SCAN HISTORY -->
+
+            <section class="content-card" id="scan-history">
+
+                <div class="section-header">
+
+                    <div>
+                        <h2>RFID Scan History</h2>
+
+                        <p>
+                            Records of all detected RFID cards.
+                        </p>
+                    </div>
+
+                    <span class="live-badge">
+                        LIVE MONITORING
+                    </span>
+
+                </div>
+
+
+                <!-- SEARCH AND FILTER -->
+
+                <div class="table-controls">
+
+                    <input
+                        type="text"
+                        id="search-input"
+                        placeholder="Search RFID UID..."
+                        oninput="renderLogs()"
+                    >
+
+                    <select id="status-filter"
+                            onchange="renderLogs()">
+
+                        <option value="all">All Status</option>
+                        <option value="authorized">Authorized</option>
+                        <option value="unauthorized">Unauthorized</option>
+
+                    </select>
+
+                </div>
+
+
+                <!-- TABLE -->
+
+                <div class="table-wrapper">
+
+                    <table>
+
+                        <thead>
+
+                            <tr>
+                                <th>SCAN ID</th>
+                                <th>RFID UID</th>
+                                <th>ACCESS STATUS</th>
+                                <th>DATE & TIME</th>
+                            </tr>
+
+                        </thead>
+
+                        <tbody id="logs-table">
+
+                            <tr>
+                                <td colspan="4" class="empty-state">
+                                    Loading RFID records...
+                                </td>
+                            </tr>
+
+                        </tbody>
+
+                    </table>
+
+                </div>
+
+
+                <div class="table-footer">
+
+                    <span id="record-count">
+                        Showing 0 records
+                    </span>
+
+                    <span>
+                        Automatic refresh: 5 seconds
+                    </span>
+
+                </div>
+
+            </section>
+
+            <!-- ==================================
+     RFID CARD MANAGEMENT
+================================== -->
+
+<section class="content-card card-management"
+         id="card-management">
+
+    <div class="section-header">
+
+        <div>
+            <h2>RFID Card Management</h2>
+
+            <p>
+                Register, update, activate, and manage RFID cards.
+            </p>
+        </div>
+
+        <button class="refresh-button"
+                onclick="openRegistrationForm()">
+            + Register New Card
+        </button>
+
+    </div>
+
+
+    <!-- REGISTRATION FORM -->
+
+    <div class="registration-form"
+         id="registration-form"
+         style="display: none;">
+
+        <h3 id="form-title">Register RFID Card</h3>
+
+        <div class="form-grid">
+
+            <div class="form-group">
+
+                <label for="card-uid">
+                    RFID Card UID
+                </label>
+
+                <input
+                    type="text"
+                    id="card-uid"
+                    placeholder="Example: 5F4A9BDA"
+                    maxlength="32"
+                >
+
+            </div>
+
+
+            <div class="form-group">
+
+                <label for="cardholder-name">
+                    Cardholder Name
+                </label>
+
+                <input
+                    type="text"
+                    id="cardholder-name"
+                    placeholder="Enter cardholder name"
+                    maxlength="100"
+                >
+
+            </div>
+
+        </div>
+
+        <div class="form-actions">
+
+            <button class="save-button"
+                    onclick="saveRFIDCard()">
+                Save Card
+            </button>
+
+            <button class="cancel-button"
+                    onclick="closeRegistrationForm()">
+                Cancel
+            </button>
+
+        </div>
+
+    </div>
+
+
+    <!-- SEARCH -->
+
+    <div class="table-controls">
+
+        <input
+            type="text"
+            id="card-search"
+            placeholder="Search card UID or cardholder..."
+            oninput="renderCards()"
+        >
+
+        <select
+            id="card-status-filter"
+            onchange="renderCards()">
+
+            <option value="all">All Cards</option>
+            <option value="active">Active</option>
+            <option value="inactive">Inactive</option>
+
+        </select>
+
+    </div>
+
+
+    <!-- CARD TABLE -->
+
+    <div class="table-wrapper">
+
+        <table>
+
+            <thead>
+
+                <tr>
+                    <th>RFID UID</th>
+                    <th>CARDHOLDER</th>
+                    <th>STATUS</th>
+                    <th>REGISTERED</th>
+                    <th>ACTIONS</th>
+                </tr>
+
+            </thead>
+
+            <tbody id="cards-table">
+
+                <tr>
+                    <td colspan="5" class="empty-state">
+                        Loading registered cards...
+                    </td>
+                </tr>
+
+            </tbody>
+
+        </table>
+
+    </div>
+
+
+    <div class="table-footer">
+
+        <span id="card-record-count">
+            Showing 0 cards
+        </span>
+
+    </div>
+
+</section>
+
+            <!-- FOOTER -->
+
+            <footer class="footer">
+
+                <p>
+                    RFID Monitoring System |
+                    ESP32 + RC522 + Flask + SQLite
+                </p>
+
+                <p>
+                    Developed for RFID Access Monitoring
+                </p>
+
+            </footer>
+
+        </main>
+
+    </div>
+
+<script src="{{ url_for('static', filename='js/functions.js') }}" defer></script>
+</body>
+
+
+</html>
