@@ -154,6 +154,17 @@ def receive_rfid_scan():
 
     uid = uid.strip().upper()
 
+    # Accept only hexadecimal UIDs (for example: 5F4A9BDA).
+    if (
+        len(uid) > 32
+        or len(uid) % 2 != 0
+        or any(character not in "0123456789ABCDEF" for character in uid)
+    ):
+        return jsonify({
+            "success": False,
+            "message": "Invalid hexadecimal RFID UID."
+        }), 400
+
     timestamp = datetime.now().astimezone().isoformat(
         timespec="seconds"
     )
@@ -222,7 +233,11 @@ def receive_rfid_scan():
 
             "cardholder": cardholder,
 
+            "cardholder_name": cardholder,
+
             "status": access_status,
+
+            "authorized": access_status == "authorized",
 
             "timestamp": timestamp
 
