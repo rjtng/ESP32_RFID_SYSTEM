@@ -2,8 +2,20 @@ from flask import Flask, request, jsonify, render_template
 from datetime import datetime
 from pathlib import Path
 import sqlite3
+import hmac
 
 app = Flask(__name__)
+
+
+
+@app.after_request
+def add_security_headers(response):
+
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "same-origin"
+
+    return response
 
 # ==========================================
 # DATABASE CONFIGURATION
@@ -11,6 +23,17 @@ app = Flask(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE = BASE_DIR / "rfid_system.db"
+
+# ==========================================
+# PHASE 9: DEVICE SECURITY CONFIGURATION
+# ==========================================
+
+# This key must match DEVICE_API_KEY in the ESP32 sketch.
+# Rotate it by changing the value in BOTH files.
+DEVICE_API_KEY = "f9753aeeb289bf822555b5aa287c4dd57de6675052c1f5daec0c4e3ce1bcba5c"
+
+# Ignore repeated scans of the same card within this interval.
+DUPLICATE_SCAN_WINDOW_SECONDS = 2
 
 
 # ==========================================
@@ -23,6 +46,17 @@ def get_db_connection():
     connection.row_factory = sqlite3.Row
 
     return connection
+
+
+
+def valid_device_request():
+
+    supplied_key = request.headers.get("X-Device-Key", "")
+
+    return bool(supplied_key) and hmac.compare_digest(
+        supplied_key,
+        DEVICE_API_KEY
+    )
 
 
 # ==========================================
@@ -63,6 +97,28 @@ def initialize_database():
 
         )
     """)
+
+    # Add a cardholder snapshot to scan history without recreating the database.
+    # Existing records are backfilled once, where the registered card is available.
+    log_columns = {
+        column["name"]
+        for column in connection.execute("PRAGMA table_info(rfid_logs)").fetchall()
+    }
+
+    if "cardholder_name" not in log_columns:
+        connection.execute(
+            "ALTER TABLE rfid_logs ADD COLUMN cardholder_name TEXT"
+        )
+
+        connection.execute("""
+            UPDATE rfid_logs
+            SET cardholder_name = (
+                SELECT cardholder_name
+                FROM rfid_cards
+                WHERE rfid_cards.card_uid = rfid_logs.card_uid
+            )
+            WHERE cardholder_name IS NULL
+        """)
 
     # PRESERVE EXISTING AUTHORIZED RFID CARD
 
@@ -119,11 +175,26 @@ def dashboard():
 @app.route("/api/status", methods=["GET"])
 def api_status():
 
-    return jsonify({
-        "success": True,
-        "status": "online",
-        "message": "ESP32 RFID REST API is running!"
-    })
+    try:
+        with get_db_connection() as connection:
+            connection.execute("SELECT 1").fetchone()
+
+        return jsonify({
+            "success": True,
+            "status": "online",
+            "database": "online",
+            "message": "Flask API and SQLite database are running."
+        }), 200
+
+    except sqlite3.Error as error:
+        print(f"Health Check Database Error: {error}")
+
+        return jsonify({
+            "success": False,
+            "status": "degraded",
+            "database": "offline",
+            "message": "The Flask API is running, but SQLite is unavailable."
+        }), 503
 
 
 # ==========================================
@@ -134,10 +205,16 @@ def api_status():
 @app.route("/api/rfid/scan", methods=["POST"])
 def receive_rfid_scan():
 
+    # PHASE 9: accept scan requests only from the ESP32 holding the key.
+    if not valid_device_request():
+        return jsonify({
+            "success": False,
+            "message": "Unauthorized device request."
+        }), 401
+
     data = request.get_json(silent=True)
 
     if not isinstance(data, dict):
-
         return jsonify({
             "success": False,
             "message": "Invalid JSON request."
@@ -146,7 +223,6 @@ def receive_rfid_scan():
     uid = data.get("uid")
 
     if not isinstance(uid, str) or not uid.strip():
-
         return jsonify({
             "success": False,
             "message": "RFID UID is required."
@@ -154,7 +230,6 @@ def receive_rfid_scan():
 
     uid = uid.strip().upper()
 
-    # Accept only hexadecimal UIDs (for example: 5F4A9BDA).
     if (
         len(uid) > 32
         or len(uid) % 2 != 0
@@ -165,15 +240,10 @@ def receive_rfid_scan():
             "message": "Invalid hexadecimal RFID UID."
         }), 400
 
-    timestamp = datetime.now().astimezone().isoformat(
-        timespec="seconds"
-    )
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
 
     try:
-
         with get_db_connection() as connection:
-
-            # CHECK REGISTERED CARD
 
             card = connection.execute("""
                 SELECT card_uid, cardholder_name, status
@@ -181,34 +251,60 @@ def receive_rfid_scan():
                 WHERE card_uid = ?
             """, (uid,)).fetchone()
 
-            # DETERMINE AUTHORIZATION
-
-            if card and card["status"] == "active":
-
-                access_status = "authorized"
+            if card:
                 cardholder = card["cardholder_name"]
-
-            else:
-
-                access_status = "unauthorized"
-                cardholder = "Unknown / Inactive Card"
-
-            # SAVE SCAN HISTORY
-
-            cursor = connection.execute("""
-                INSERT INTO rfid_logs (
-                    card_uid,
-                    status,
-                    timestamp
+                access_status = (
+                    "authorized"
+                    if card["status"] == "active"
+                    else "unauthorized"
                 )
-                VALUES (?, ?, ?)
-            """, (
-                uid,
-                access_status,
-                timestamp
-            ))
+            else:
+                access_status = "unauthorized"
+                cardholder = "Unknown / Unregistered Card"
 
-            scan_id = cursor.lastrowid
+            # Suppress a second database entry for the same UID within
+            # the configured short interval. Authorization is still
+            # recalculated from the current card status above.
+            previous_scan = connection.execute("""
+                SELECT id, timestamp
+                FROM rfid_logs
+                WHERE card_uid = ?
+                ORDER BY id DESC
+                LIMIT 1
+            """, (uid,)).fetchone()
+
+            duplicate = False
+            scan_id = None
+            saved_timestamp = timestamp
+
+            if previous_scan:
+                try:
+                    previous_time = datetime.fromisoformat(
+                        previous_scan["timestamp"]
+                    )
+                    current_time = datetime.fromisoformat(timestamp)
+                    elapsed = (current_time - previous_time).total_seconds()
+
+                    if 0 <= elapsed < DUPLICATE_SCAN_WINDOW_SECONDS:
+                        duplicate = True
+                        scan_id = previous_scan["id"]
+                        saved_timestamp = previous_scan["timestamp"]
+                except (TypeError, ValueError):
+                    # If an old timestamp cannot be parsed, record this scan.
+                    pass
+
+            if not duplicate:
+                cursor = connection.execute("""
+                    INSERT INTO rfid_logs (
+                        card_uid,
+                        cardholder_name,
+                        status,
+                        timestamp
+                    )
+                    VALUES (?, ?, ?, ?)
+                """, (uid, cardholder, access_status, timestamp))
+
+                scan_id = cursor.lastrowid
 
         print("\n================================")
         print("       RFID SCAN RECEIVED")
@@ -217,34 +313,24 @@ def receive_rfid_scan():
         print(f"Card UID   : {uid}")
         print(f"Cardholder : {cardholder}")
         print(f"Status     : {access_status.upper()}")
-        print(f"Time       : {timestamp}")
-        print("Database   : SAVED SUCCESSFULLY")
+        print(f"Duplicate  : {'YES - SUPPRESSED' if duplicate else 'NO'}")
+        print(f"Time       : {saved_timestamp}")
         print("================================")
 
         return jsonify({
-
             "success": True,
-
             "message": "RFID scan processed successfully.",
-
             "id": scan_id,
-
             "uid": uid,
-
             "cardholder": cardholder,
-
             "cardholder_name": cardholder,
-
             "status": access_status,
-
             "authorized": access_status == "authorized",
-
-            "timestamp": timestamp
-
+            "duplicate": duplicate,
+            "timestamp": saved_timestamp
         }), 200
 
     except sqlite3.Error as error:
-
         print(f"Database Error: {error}")
 
         return jsonify({
@@ -283,6 +369,10 @@ def get_rfid_logs():
                 SELECT
                     id,
                     card_uid,
+                    COALESCE(
+                        NULLIF(cardholder_name, ''),
+                        'Unknown / Unregistered Card'
+                    ) AS cardholder_name,
                     status,
                     timestamp
                 FROM rfid_logs

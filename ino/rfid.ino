@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <ESP32Servo.h>
 
 // ========================================
 // 1. WI-FI CONFIGURATION
@@ -12,9 +13,12 @@ const char* ssid = "AL-RAJI";
 const char* password = "";
 
 const char* serverURL =
-  "http://10.210.208.251:5000/api/rfid/scan";
+  "http://10.103.22.251:5000/api/rfid/scan";
 
-const char* serverIP = "10.210.208.251";
+const char* serverIP = "10.103.22.251";
+
+// Must match DEVICE_API_KEY in app.py.
+const char* DEVICE_API_KEY = "f9753aeeb289bf822555b5aa287c4dd57de6675052c1f5daec0c4e3ce1bcba5c";
 
 // ========================================
 // 2. RFID CONFIGURATION
@@ -37,7 +41,22 @@ MFRC522 rfid(SS_PIN, RST_PIN);
 #define BUZZER    26
 
 // ========================================
-// 4. AUTHORIZATION RESULT
+// 4. SG90 DOOR-LOCK SERVO CONFIGURATION
+// ========================================
+
+#define SERVO_PIN 13
+
+// Adjust these angles to match the physical latch mechanism.
+const int LOCKED_ANGLE = 0;
+const int UNLOCKED_ANGLE = 90;
+const unsigned long DOOR_UNLOCK_DURATION_MS = 5000;
+
+Servo doorServo;
+bool doorIsUnlocked = false;
+unsigned long doorUnlockStartedAt = 0;
+
+// ========================================
+// 5. AUTHORIZATION RESULT
 // ========================================
 
 enum AuthorizationResult {
@@ -47,7 +66,7 @@ enum AuthorizationResult {
 };
 
 // ========================================
-// 5. FUNCTION DECLARATIONS
+// 6. FUNCTION DECLARATIONS
 // ========================================
 
 void connectWiFi();
@@ -58,9 +77,11 @@ void indicateAuthorized();
 void indicateUnauthorized();
 void indicateServerError();
 void clearIndicators();
+void unlockDoor();
+void updateDoorLock();
 
 // ========================================
-// 6. SETUP
+// 7. SETUP
 // ========================================
 
 void setup() {
@@ -77,12 +98,19 @@ void setup() {
   pinMode(RED_LED, OUTPUT);
   pinMode(BUZZER, OUTPUT);
 
+  // Initialize the SG90 and command the door to the locked position.
+  doorServo.setPeriodHertz(50);
+  doorServo.attach(SERVO_PIN, 500, 2400);
+  doorServo.write(LOCKED_ANGLE);
+  delay(500);
+  doorIsUnlocked = false;
+
   clearIndicators();
 
   Serial.println();
   Serial.println("================================");
-  Serial.println(" ESP32 RFID SYSTEM - PHASE 8");
-  Serial.println(" SERVER-SIDE AUTHORIZATION");
+  Serial.println(" ESP32 RFID SYSTEM - PHASE 9");
+  Serial.println(" RFID + SG90 DOOR LOCK");
   Serial.println("================================");
 
   connectWiFi();
@@ -95,12 +123,22 @@ void setup() {
 }
 
 // ========================================
-// 7. MAIN LOOP
+// 8. MAIN LOOP
 // ========================================
 
 void loop() {
 
-  // Reconnect to Wi-Fi when disconnected.
+  // Service the automatic relock timer on every pass.
+  updateDoorLock();
+
+  // Do not process another card while the door is unlocked.
+  // This keeps blocking network requests from delaying the relock.
+  if (doorIsUnlocked) {
+    delay(20);
+    return;
+  }
+
+  // Reconnect to Wi-Fi when disconnected. The door remains locked.
   if (WiFi.status() != WL_CONNECTED) {
 
     Serial.println("Wi-Fi disconnected. Reconnecting...");
@@ -133,13 +171,18 @@ void loop() {
   Serial.print("Card UID: ");
   Serial.println(cardUID);
 
-  // Ask the Flask server to decide authorization.
+  // Flask remains the authority. No local UID allowlist is used.
   AuthorizationResult result = sendToServer(cardUID);
+
+  // Finish communication with the RFID card before handling the result.
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
 
   if (result == AUTHORIZED) {
 
     Serial.println("ACCESS GRANTED BY SERVER!");
     indicateAuthorized();
+    unlockDoor();
 
   } else if (result == UNAUTHORIZED) {
 
@@ -148,7 +191,7 @@ void loop() {
 
   } else {
 
-    // Fail closed: no server response means no access grant.
+    // Fail closed: a server/network error must never unlock the door.
     Serial.println("AUTHORIZATION UNAVAILABLE.");
     Serial.println("ACCESS NOT GRANTED.");
     indicateServerError();
@@ -156,19 +199,44 @@ void loop() {
   }
 
   Serial.println("--------------------------------");
-
-  delay(1500);
-  clearIndicators();
-
-  // Finish communication with the RFID card.
-  rfid.PICC_HaltA();
-  rfid.PCD_StopCrypto1();
-
-  delay(500);
+  delay(20);
 }
 
 // ========================================
-// 8. WI-FI CONNECTION
+// 9. SG90 DOOR-LOCK CONTROL
+// ========================================
+
+void unlockDoor() {
+
+  if (doorIsUnlocked) {
+    return;
+  }
+
+  Serial.println("DOOR UNLOCKED: SG90 moving to unlock position.");
+  doorServo.write(UNLOCKED_ANGLE);
+  doorUnlockStartedAt = millis();
+  doorIsUnlocked = true;
+
+  Serial.println("Door will relock automatically after 5 seconds.");
+}
+
+void updateDoorLock() {
+
+  if (!doorIsUnlocked) {
+    return;
+  }
+
+  if (millis() - doorUnlockStartedAt >= DOOR_UNLOCK_DURATION_MS) {
+
+    doorServo.write(LOCKED_ANGLE);
+    doorIsUnlocked = false;
+
+    Serial.println("DOOR RELOCKED: SG90 returned to locked position.");
+  }
+}
+
+// ========================================
+// 10. WI-FI CONNECTION
 // ========================================
 
 void connectWiFi() {
@@ -211,7 +279,7 @@ void connectWiFi() {
 }
 
 // ========================================
-// 9. GET RFID CARD UID
+// 11. GET RFID CARD UID
 // ========================================
 
 String getCardUID() {
@@ -232,7 +300,7 @@ String getCardUID() {
 }
 
 // ========================================
-// 10. SEND UID TO FLASK AND READ DECISION
+// 12. SEND UID TO FLASK AND READ DECISION
 // ========================================
 
 AuthorizationResult sendToServer(const String& uid) {
@@ -253,6 +321,7 @@ AuthorizationResult sendToServer(const String& uid) {
   }
 
   http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Key", DEVICE_API_KEY);
 
   // Send only the UID. Flask must determine the card's status.
   String jsonPayload = "{\"uid\":\"" + uid + "\"}";
@@ -310,6 +379,12 @@ AuthorizationResult sendToServer(const String& uid) {
   Serial.print("Cardholder: ");
   Serial.println(cardholder);
 
+  bool duplicate = responseDocument["duplicate"] | false;
+
+  if (duplicate) {
+    Serial.println("Duplicate scan detected by server; log entry suppressed.");
+  }
+
   http.end();
 
   if (!success) {
@@ -330,7 +405,7 @@ AuthorizationResult sendToServer(const String& uid) {
 }
 
 // ========================================
-// 11. AUTHORIZED CARD INDICATION
+// 13. AUTHORIZED CARD INDICATION
 // ========================================
 
 void indicateAuthorized() {
@@ -345,7 +420,7 @@ void indicateAuthorized() {
 }
 
 // ========================================
-// 12. UNAUTHORIZED CARD INDICATION
+// 14. UNAUTHORIZED CARD INDICATION
 // ========================================
 
 void indicateUnauthorized() {
@@ -365,7 +440,7 @@ void indicateUnauthorized() {
 }
 
 // ========================================
-// 13. SERVER / NETWORK ERROR INDICATION
+// 15. SERVER / NETWORK ERROR INDICATION
 // ========================================
 
 void indicateServerError() {
@@ -387,7 +462,7 @@ void indicateServerError() {
 }
 
 // ========================================
-// 14. TURN OFF ALL INDICATORS
+// 16. TURN OFF ALL INDICATORS
 // ========================================
 
 void clearIndicators() {
@@ -398,7 +473,7 @@ void clearIndicators() {
 }
 
 // ========================================
-// 15. TEST FLASK SERVER CONNECTION
+// 17. TEST FLASK SERVER CONNECTION
 // ========================================
 
 void testFlaskConnection() {
