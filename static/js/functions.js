@@ -14,6 +14,44 @@ let editingCardUID = null;
 
 
 // =====================================================
+// SIGNED-IN API REQUESTS
+// =====================================================
+
+// The server puts a one-time token for this login into the page.
+// Every request that changes data must send it back.
+
+const csrfToken = (
+    document.querySelector('meta[name="csrf-token"]') || {}
+).content || "";
+
+async function apiFetch(url, options = {}) {
+
+    const headers = new Headers(options.headers || {});
+    const method = (options.method || "GET").toUpperCase();
+
+    if (method !== "GET" && method !== "HEAD") {
+        headers.set("X-CSRF-Token", csrfToken);
+    }
+
+    const response = await fetch(url, {
+        ...options,
+        headers: headers,
+        credentials: "same-origin"
+    });
+
+    // Session ended (signed out, expired or password changed):
+    // go back to the sign-in page, and stop the calling code so it
+    // does not show error pop-ups on the way.
+    if (response.status === 401) {
+        window.location.href = "/login";
+        return new Promise(() => {});
+    }
+
+    return response;
+}
+
+
+// =====================================================
 // UPDATE CURRENT DATE
 // =====================================================
 
@@ -84,7 +122,7 @@ async function loadStatistics() {
 
     try {
 
-        const response = await fetch(
+        const response = await apiFetch(
             "/api/rfid/statistics"
         );
 
@@ -126,7 +164,7 @@ async function loadLogs() {
 
     try {
 
-        const response = await fetch(
+        const response = await apiFetch(
             "/api/rfid/logs?limit=1000"
         );
 
@@ -326,7 +364,7 @@ async function loadCards() {
 
     try {
 
-        const response = await fetch("/api/rfid/cards");
+        const response = await apiFetch("/api/rfid/cards");
 
         const data = await response.json();
 
@@ -557,7 +595,7 @@ async function saveRFIDCard() {
 
     try {
 
-        const response = await fetch(url, {
+        const response = await apiFetch(url, {
 
             method: method,
 
@@ -656,7 +694,7 @@ async function toggleCardStatus(uid, status) {
 
     try {
 
-        const response = await fetch(
+        const response = await apiFetch(
             `/api/rfid/cards/${encodeURIComponent(uid)}/status`,
             {
 
@@ -719,7 +757,7 @@ async function deleteRFIDCard(uid) {
 
     try {
 
-        const response = await fetch(
+        const response = await apiFetch(
             `/api/rfid/cards/${encodeURIComponent(uid)}`,
             {
                 method: "DELETE"

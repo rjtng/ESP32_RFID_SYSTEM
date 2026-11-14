@@ -1,8 +1,21 @@
-from flask import Flask, request, jsonify, render_template
+from flask import (
+    Flask, request, jsonify, render_template,
+    redirect, url_for, session
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
-import sqlite3
+import click
+import hashlib
 import hmac
+import math
+import os
+import re
+import secrets
+import sqlite3
+import sys
+import time
 
 app = Flask(__name__)
 
@@ -101,6 +114,34 @@ def initialize_database():
         )
     """)
 
+    # DASHBOARD LOGIN ACCOUNTS
+    # Only password hashes are stored, never the passwords themselves.
+
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS admin_users (
+            username TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    # FAILED LOGIN ATTEMPTS
+    # Used to slow down password guessing from one IP address.
+
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip_address TEXT NOT NULL,
+            attempted_at REAL NOT NULL
+        )
+    """)
+
+    connection.execute("""
+        CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_time
+        ON login_attempts (ip_address, attempted_at)
+    """)
+
     # UPGRADE OLDER DATABASES
     # Databases created before scan history stored cardholder names
     # get the new column here. Their existing scans keep a NULL name
@@ -131,6 +172,7 @@ def initialize_database():
 
     print("SQLite database initialized successfully!")
     print("RFID card management table initialized!")
+    print("Dashboard login tables initialized!")
 
 
 # ==========================================
@@ -141,6 +183,517 @@ def initialize_database():
 # "python app.py", "flask run" or a production server.
 
 initialize_database()
+
+
+# ==========================================
+# PHASE 10: DASHBOARD LOGIN
+# ==========================================
+
+# Everything is private by default. Only these endpoints work without
+# signing in:
+#   static             the CSS and JavaScript the login page needs
+#   login              the sign-in page itself
+#   api_status         health check (the ESP32 calls it when it boots)
+#   receive_rfid_scan  protected by the device key instead of a login
+
+PUBLIC_ENDPOINTS = {"static", "login", "api_status", "receive_rfid_scan"}
+
+# A login stays valid this long. The dashboard polls the server
+# constantly, so this is a fixed limit, not an idle timeout.
+SESSION_MAX_AGE_SECONDS = 12 * 60 * 60
+
+# After this many wrong passwords from one IP address inside the window
+# below, that address is blocked until its oldest failure expires.
+MAX_FAILED_LOGINS = 5
+LOCKOUT_WINDOW_SECONDS = 5 * 60
+
+MIN_PASSWORD_LENGTH = 8
+MAX_PASSWORD_LENGTH = 256
+
+USERNAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{2,31}$")
+PASSWORD_HASH_METHOD = "pbkdf2:sha256"
+
+
+# ------------------------------------------
+# Session settings
+# ------------------------------------------
+
+def load_secret_key():
+
+    # The key that signs the login cookie. Use RFID_SECRET_KEY if it is
+    # set, otherwise create a random key once and keep it in
+    # secret_key.txt (keep that file private: do not upload it to GitHub).
+
+    from_environment = os.environ.get("RFID_SECRET_KEY")
+
+    if from_environment:
+        return from_environment
+
+    key_file = BASE_DIR / "secret_key.txt"
+
+    try:
+
+        # Mode "x" only creates the file if it does not exist yet, so two
+        # server processes can never overwrite each other's key.
+        with open(key_file, "x", encoding="utf-8") as file:
+            file.write(secrets.token_hex(32))
+
+        try:
+            os.chmod(key_file, 0o600)
+        except OSError:
+            pass
+
+    except FileExistsError:
+        pass
+
+    except OSError as error:
+        print(f"WARNING: could not save secret_key.txt ({error}).")
+        print("Dashboard logins will end whenever the server restarts.")
+        return secrets.token_hex(32)
+
+    for _ in range(20):
+
+        key = key_file.read_text(encoding="utf-8").strip()
+
+        if key:
+            return key
+
+        time.sleep(0.1)     # another process is still writing it
+
+    raise RuntimeError("secret_key.txt is empty. Delete it and restart.")
+
+
+app.config.update(
+    SECRET_KEY=load_secret_key(),
+    SESSION_COOKIE_NAME="rfid_session",
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+
+    # Set RFID_HTTPS=1 once the dashboard is served over HTTPS. Turning
+    # this on while using plain HTTP would stop the browser sending the
+    # cookie, so it is off by default.
+    SESSION_COOKIE_SECURE=os.environ.get("RFID_HTTPS") == "1",
+
+    PERMANENT_SESSION_LIFETIME=SESSION_MAX_AGE_SECONDS,
+)
+
+
+# ------------------------------------------
+# Admin accounts (only password hashes are stored)
+# ------------------------------------------
+
+def get_admin_password_hash(username):
+
+    with closing(get_db_connection()) as connection:
+
+        row = connection.execute(
+            "SELECT password_hash FROM admin_users WHERE username = ?",
+            (username,)
+        ).fetchone()
+
+    return row["password_hash"] if row else None
+
+
+def admin_exists():
+
+    with closing(get_db_connection()) as connection:
+
+        row = connection.execute(
+            "SELECT 1 FROM admin_users LIMIT 1"
+        ).fetchone()
+
+    return row is not None
+
+
+def validate_new_account(username, password):
+
+    if not USERNAME_PATTERN.match(username):
+        return (
+            "Username must be 3-32 characters: lowercase letters, "
+            "numbers, dots, dashes or underscores."
+        )
+
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
+
+    if len(password) > MAX_PASSWORD_LENGTH:
+        return f"Password must be at most {MAX_PASSWORD_LENGTH} characters."
+
+    if password.lower() == username:
+        return "Password must not be the same as the username."
+
+    return None
+
+
+def save_admin_account(username, password):
+
+    password_hash = generate_password_hash(
+        password,
+        method=PASSWORD_HASH_METHOD
+    )
+
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+
+    with closing(get_db_connection()) as connection:
+
+        updated = connection.execute("""
+            UPDATE admin_users
+            SET password_hash = ?, updated_at = ?
+            WHERE username = ?
+        """, (password_hash, timestamp, username)).rowcount
+
+        if updated == 0:
+
+            connection.execute("""
+                INSERT INTO admin_users (
+                    username,
+                    password_hash,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?)
+            """, (username, password_hash, timestamp, timestamp))
+
+        connection.commit()
+
+
+_dummy_password_hash = None
+
+
+def dummy_password_hash():
+
+    # Checked when the username does not exist, so a wrong username
+    # takes as long to reject as a wrong password.
+
+    global _dummy_password_hash
+
+    if _dummy_password_hash is None:
+        _dummy_password_hash = generate_password_hash(
+            secrets.token_hex(16),
+            method=PASSWORD_HASH_METHOD
+        )
+
+    return _dummy_password_hash
+
+
+def prompt_for_admin_account(default_username="admin"):
+
+    # Asks on the console, so the password never appears in a file,
+    # in a command line or in the shell history.
+
+    while True:
+
+        username = click.prompt(
+            "Dashboard username",
+            default=default_username
+        ).strip().lower()
+
+        password = click.prompt(
+            "Dashboard password",
+            hide_input=True,
+            confirmation_prompt=True
+        )
+
+        problem = validate_new_account(username, password)
+
+        if problem is None:
+            break
+
+        click.echo(f"\n{problem}\n")
+
+    save_admin_account(username, password)
+
+    click.echo(f"\nSaved. You can now sign in as '{username}'.")
+
+    return username
+
+
+@app.cli.command("set-admin-password")
+@click.option(
+    "--username",
+    default="admin",
+    show_default=True,
+    help="Account to create, or to reset the password of."
+)
+def set_admin_password_command(username):
+    """Create the dashboard login, or reset its password.
+
+    Resetting a password signs out everyone who is logged in.
+    """
+
+    prompt_for_admin_account(default_username=username)
+
+
+# ------------------------------------------
+# Slowing down password guessing
+# ------------------------------------------
+
+def client_ip():
+
+    return request.remote_addr or "unknown"
+
+
+def seconds_until_unlocked(ip_address):
+
+    cutoff = time.time() - LOCKOUT_WINDOW_SECONDS
+
+    with closing(get_db_connection()) as connection:
+
+        attempts = [
+            row["attempted_at"]
+            for row in connection.execute("""
+                SELECT attempted_at
+                FROM login_attempts
+                WHERE ip_address = ? AND attempted_at > ?
+                ORDER BY attempted_at
+            """, (ip_address, cutoff))
+        ]
+
+    if len(attempts) < MAX_FAILED_LOGINS:
+        return 0
+
+    # Blocked until the oldest counted failure leaves the window.
+    unlock_at = attempts[-MAX_FAILED_LOGINS] + LOCKOUT_WINDOW_SECONDS
+
+    return max(1, math.ceil(unlock_at - time.time()))
+
+
+def record_failed_login(ip_address):
+
+    now = time.time()
+
+    with closing(get_db_connection()) as connection:
+
+        connection.execute(
+            "DELETE FROM login_attempts WHERE attempted_at < ?",
+            (now - LOCKOUT_WINDOW_SECONDS,)
+        )
+
+        connection.execute(
+            "INSERT INTO login_attempts (ip_address, attempted_at) VALUES (?, ?)",
+            (ip_address, now)
+        )
+
+        connection.commit()
+
+
+def clear_failed_logins(ip_address):
+
+    with closing(get_db_connection()) as connection:
+
+        connection.execute(
+            "DELETE FROM login_attempts WHERE ip_address = ?",
+            (ip_address,)
+        )
+
+        connection.commit()
+
+
+# ------------------------------------------
+# Who is signed in, and CSRF protection
+# ------------------------------------------
+
+def password_fingerprint(password_hash):
+
+    # Stored in the session so that resetting the password signs out
+    # every browser that was logged in with the old one.
+
+    return hashlib.sha256(password_hash.encode("utf-8")).hexdigest()[:32]
+
+
+def current_username():
+
+    username = session.get("username")
+    login_at = session.get("login_at")
+
+    if not username or not isinstance(login_at, (int, float)):
+        return None
+
+    if time.time() - login_at > SESSION_MAX_AGE_SECONDS:
+        session.clear()
+        return None
+
+    password_hash = get_admin_password_hash(username)
+
+    if password_hash is None or not hmac.compare_digest(
+        str(session.get("fingerprint", "")),
+        password_fingerprint(password_hash)
+    ):
+        session.clear()
+        return None
+
+    return username
+
+
+def get_csrf_token():
+
+    token = session.get("csrf_token")
+
+    if not token:
+        token = secrets.token_hex(32)
+        session["csrf_token"] = token
+
+    return token
+
+
+def csrf_token_is_valid():
+
+    expected = session.get("csrf_token")
+
+    supplied = (
+        request.headers.get("X-CSRF-Token")
+        or request.form.get("csrf_token")
+        or ""
+    )
+
+    return bool(expected) and hmac.compare_digest(
+        supplied.encode("utf-8"),
+        expected.encode("utf-8")
+    )
+
+
+# ------------------------------------------
+# Checks that run before every request
+# ------------------------------------------
+
+@app.before_request
+def require_login():
+
+    # Unknown URLs fall through to Flask's normal 404 page.
+    if request.endpoint is None or request.endpoint in PUBLIC_ENDPOINTS:
+        return None
+
+    if current_username() is None:
+
+        if request.path.startswith("/api/"):
+            return jsonify({
+                "success": False,
+                "message": "Please sign in to use the dashboard."
+            }), 401
+
+        return redirect(url_for("login"))
+
+    # Anything that changes data must carry the token that the server
+    # put into the page, which proves the request came from our own page.
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+
+        if not csrf_token_is_valid():
+            return jsonify({
+                "success": False,
+                "message": "Security check failed. Refresh the page and try again."
+            }), 403
+
+    return None
+
+
+@app.context_processor
+def inject_login_context():
+
+    return {
+        "csrf_token": get_csrf_token(),
+        "username": current_username()
+    }
+
+
+@app.after_request
+def prevent_caching(response):
+
+    # Dashboard pages and data must never be cached: after logging out,
+    # the Back button must not show the dashboard again.
+    if request.endpoint != "static":
+        response.headers["Cache-Control"] = "no-store"
+
+    return response
+
+
+# ------------------------------------------
+# Login and logout pages
+# ------------------------------------------
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+
+    if current_username() is not None:
+        return redirect(url_for("dashboard"))
+
+    setup_needed = not admin_exists()
+
+    if request.method == "GET":
+        return render_template("login.html", setup_needed=setup_needed)
+
+    if setup_needed:
+        return render_template("login.html", setup_needed=True), 403
+
+    if not csrf_token_is_valid():
+        return render_template(
+            "login.html",
+            setup_needed=False,
+            error="Your page expired. Please try again."
+        ), 400
+
+    ip_address = client_ip()
+    wait_seconds = seconds_until_unlocked(ip_address)
+
+    if wait_seconds > 0:
+
+        minutes = math.ceil(wait_seconds / 60)
+        unit = "minute" if minutes == 1 else "minutes"
+
+        print(f"Dashboard login: {ip_address} is blocked for {wait_seconds} seconds")
+
+        return render_template(
+            "login.html",
+            setup_needed=False,
+            error=f"Too many failed attempts. Try again in {minutes} {unit}."
+        ), 429, {"Retry-After": str(wait_seconds)}
+
+    username = request.form.get("username", "").strip().lower()[:64]
+    password = request.form.get("password", "")[:MAX_PASSWORD_LENGTH + 1]
+
+    stored_hash = get_admin_password_hash(username)
+
+    password_ok = check_password_hash(
+        stored_hash or dummy_password_hash(),
+        password
+    ) and stored_hash is not None
+
+    if not password_ok:
+
+        record_failed_login(ip_address)
+
+        print(f"Dashboard login: failed attempt from {ip_address}")
+
+        # The same message whether the username or the password was wrong.
+        # (Status 200 on purpose: an ordinary typo should not show up as a
+        # failed request in the browser's developer console.)
+        return render_template(
+            "login.html",
+            setup_needed=False,
+            error="Incorrect username or password.",
+            entered_username=username
+        )
+
+    clear_failed_logins(ip_address)
+
+    # Start a brand-new session on every login (prevents session fixation).
+    session.clear()
+    session.permanent = True
+    session["username"] = username
+    session["login_at"] = int(time.time())
+    session["fingerprint"] = password_fingerprint(stored_hash)
+    session["csrf_token"] = secrets.token_hex(32)
+
+    print(f"Dashboard login: '{username}' signed in from {ip_address}")
+
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+
+    session.clear()
+
+    return redirect(url_for("login"))
 
 
 # ==========================================
@@ -782,6 +1335,16 @@ if __name__ == "__main__":
     print("\n================================")
     print("   ESP32 RFID SYSTEM STARTING")
     print("================================")
+
+    # First run: offer to create the dashboard login right here.
+    if not admin_exists():
+
+        if sys.stdin.isatty():
+            print("\nNo dashboard login exists yet. Let's create one.\n")
+            prompt_for_admin_account()
+        else:
+            print("\nNo dashboard login exists yet. Create one with:")
+            print("    python -m flask --app app set-admin-password")
 
     app.run(
         host="0.0.0.0",

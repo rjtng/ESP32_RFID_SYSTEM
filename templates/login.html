@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Sign in | RFID Monitoring Dashboard</title>
+
+    <link rel="stylesheet"
+          href="{{ url_for('static', filename='style.css') }}">
+</head>
+
+<body class="login-page">
+
+    <div class="login-wrapper">
+
+        <div class="brand">
+            <div class="brand-icon">RF</div>
+
+            <div>
+                <h2>RFID SYSTEM</h2>
+                <p>Monitoring Platform</p>
+            </div>
+        </div>
+
+
+        <main class="login-card">
+
+            <h1>Sign in</h1>
+
+            {% if setup_needed %}
+
+            <div class="login-notice">
+                <strong>No dashboard account exists yet.</strong>
+                On the computer that runs the server, create one with:
+                <code>python -m flask --app app set-admin-password</code>
+            </div>
+
+            {% else %}
+
+            <p class="login-intro">
+                Enter your administrator account to open the dashboard.
+            </p>
+
+            {% if error %}
+            <div class="login-error" role="alert">{{ error }}</div>
+            {% endif %}
+
+            <form class="login-form"
+                  method="post"
+                  action="{{ url_for('login') }}">
+
+                <input type="hidden"
+                       name="csrf_token"
+                       value="{{ csrf_token }}">
+
+                <div class="form-group">
+
+                    <label for="username">Username</label>
+
+                    <input
+                        type="text"
+                        id="username"
+                        name="username"
+                        value="{{ entered_username or '' }}"
+                        autocomplete="username"
+                        autocapitalize="none"
+                        spellcheck="false"
+                        maxlength="64"
+                        required
+                        {% if not entered_username %}autofocus{% endif %}
+                    >
+
+                </div>
+
+                <div class="form-group">
+
+                    <label for="password">Password</label>
+
+                    <input
+                        type="password"
+                        id="password"
+                        name="password"
+                        autocomplete="current-password"
+                        maxlength="256"
+                        required
+                        {% if entered_username %}autofocus{% endif %}
+                    >
+
+                </div>
+
+                <button type="submit" class="save-button login-submit">
+                    Sign in
+                </button>
+
+            </form>
+
+            {% endif %}
+
+        </main>
+
+        <p class="login-footer">
+            RFID Monitoring System |
+            ESP32 + RC522 + Flask + SQLite
+        </p>
+
+    </div>
+
+</body>
+
+</html>
