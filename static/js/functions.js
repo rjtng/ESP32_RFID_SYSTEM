@@ -150,7 +150,7 @@ async function loadLogs() {
 
         document.getElementById("logs-table").innerHTML = `
             <tr>
-                <td colspan="4" class="empty-state">
+                <td colspan="5" class="empty-state">
                     Unable to load RFID records.
                 </td>
             </tr>
@@ -181,14 +181,17 @@ function renderLogs() {
 
     const filteredLogs = allLogs.filter(log => {
 
-        const matchesUID =
-            log.card_uid.toUpperCase().includes(searchValue);
+        const matchesSearch =
+            log.card_uid.toUpperCase().includes(searchValue) ||
+            (log.cardholder_name || "")
+                .toUpperCase()
+                .includes(searchValue);
 
         const matchesStatus =
             selectedStatus === "all" ||
             log.status === selectedStatus;
 
-        return matchesUID && matchesStatus;
+        return matchesSearch && matchesStatus;
 
     });
 
@@ -197,7 +200,7 @@ function renderLogs() {
 
         table.innerHTML = `
             <tr>
-                <td colspan="4" class="empty-state">
+                <td colspan="5" class="empty-state">
                     No RFID records found.
                 </td>
             </tr>
@@ -247,6 +250,10 @@ function renderLogs() {
                 </td>
 
                 <td>
+                    ${formatCardholder(log.cardholder_name)}
+                </td>
+
+                <td>
                     <span class="status-badge ${statusClass}">
                         ${statusLabel}
                     </span>
@@ -284,6 +291,24 @@ function escapeHTML(value) {
             "'": "&#039;"
         })[character]
     );
+
+}
+
+
+// =====================================================
+// DISPLAY CARDHOLDER NAME
+// =====================================================
+
+function formatCardholder(name) {
+
+    // Scans saved before names were recorded have no name.
+    if (!name) {
+
+        return '<span title="No cardholder name was saved for this scan">&mdash;</span>';
+
+    }
+
+    return escapeHTML(name);
 
 }
 

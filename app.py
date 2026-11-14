@@ -68,6 +68,8 @@ def initialize_database():
     connection = get_db_connection()
 
     # RFID SCAN HISTORY
+    # cardholder_name is saved at scan time, so the history stays
+    # accurate even after a card is renamed or deleted.
 
     connection.execute("""
         CREATE TABLE IF NOT EXISTS rfid_logs (
@@ -75,7 +77,8 @@ def initialize_database():
             card_uid TEXT NOT NULL,
             status TEXT NOT NULL
                 CHECK(status IN ('authorized', 'unauthorized')),
-            timestamp TEXT NOT NULL
+            timestamp TEXT NOT NULL,
+            cardholder_name TEXT
         )
     """)
 
@@ -98,64 +101,46 @@ def initialize_database():
         )
     """)
 
-    # Add a cardholder snapshot to scan history without recreating the database.
-    # Existing records are backfilled once, where the registered card is available.
-    log_columns = {
-        column["name"]
-        for column in connection.execute("PRAGMA table_info(rfid_logs)").fetchall()
-    }
+    # UPGRADE OLDER DATABASES
+    # Databases created before scan history stored cardholder names
+    # get the new column here. Their existing scans keep a NULL name
+    # because who held the card at the time was never recorded.
+
+    log_columns = [
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(rfid_logs)")
+    ]
 
     if "cardholder_name" not in log_columns:
-        connection.execute(
-            "ALTER TABLE rfid_logs ADD COLUMN cardholder_name TEXT"
-        )
 
-        connection.execute("""
-            UPDATE rfid_logs
-            SET cardholder_name = (
-                SELECT cardholder_name
-                FROM rfid_cards
-                WHERE rfid_cards.card_uid = rfid_logs.card_uid
-            )
-            WHERE cardholder_name IS NULL
-        """)
+        try:
 
-    # PRESERVE EXISTING AUTHORIZED RFID CARD
+            connection.execute("""
+                ALTER TABLE rfid_logs
+                ADD COLUMN cardholder_name TEXT
+            """)
 
-    existing_card = connection.execute("""
-        SELECT card_uid
-        FROM rfid_cards
-        WHERE card_uid = ?
-    """, ("5F4A9BDA",)).fetchone()
+        except sqlite3.OperationalError as error:
 
-    if existing_card is None:
-
-        timestamp = datetime.now().astimezone().isoformat(
-            timespec="seconds"
-        )
-
-        connection.execute("""
-            INSERT INTO rfid_cards (
-                card_uid,
-                cardholder_name,
-                status,
-                created_at,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            "5F4A9BDA",
-            "Administrator",
-            "active",
-            timestamp,
-            timestamp
-        ))
+            # Another worker process may have added it first.
+            if "duplicate column name" not in str(error).lower():
+                raise
 
     connection.commit()
     connection.close()
 
     print("SQLite database initialized successfully!")
     print("RFID card management table initialized!")
+
+
+# ==========================================
+# RUN INITIALIZATION ON IMPORT
+# ==========================================
+
+# Creates or upgrades the tables however the app is started:
+# "python app.py", "flask run" or a production server.
+
+initialize_database()
 
 
 # ==========================================
@@ -251,16 +236,21 @@ def receive_rfid_scan():
                 WHERE card_uid = ?
             """, (uid,)).fetchone()
 
-            if card:
+            if card and card["status"] == "active":
+                access_status = "authorized"
                 cardholder = card["cardholder_name"]
-                access_status = (
-                    "authorized"
-                    if card["status"] == "active"
-                    else "unauthorized"
-                )
             else:
                 access_status = "unauthorized"
-                cardholder = "Unknown / Unregistered Card"
+                cardholder = "Unknown / Inactive Card"
+
+            # Name saved with the scan. Registered cards keep their name
+            # even while inactive; unknown UIDs are labelled so the
+            # history stays readable.
+            logged_name = (
+                card["cardholder_name"]
+                if card is not None
+                else "Unregistered card"
+            )
 
             # Suppress a second database entry for the same UID within
             # the configured short interval. Authorization is still
@@ -302,7 +292,7 @@ def receive_rfid_scan():
                         timestamp
                     )
                     VALUES (?, ?, ?, ?)
-                """, (uid, cardholder, access_status, timestamp))
+                """, (uid, logged_name, access_status, timestamp))
 
                 scan_id = cursor.lastrowid
 
@@ -369,10 +359,7 @@ def get_rfid_logs():
                 SELECT
                     id,
                     card_uid,
-                    COALESCE(
-                        NULLIF(cardholder_name, ''),
-                        'Unknown / Unregistered Card'
-                    ) AS cardholder_name,
+                    cardholder_name,
                     status,
                     timestamp
                 FROM rfid_logs
@@ -795,8 +782,6 @@ if __name__ == "__main__":
     print("\n================================")
     print("   ESP32 RFID SYSTEM STARTING")
     print("================================")
-
-    initialize_database()
 
     app.run(
         host="0.0.0.0",

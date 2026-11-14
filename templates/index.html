@@ -191,7 +191,7 @@
                     <input
                         type="text"
                         id="search-input"
-                        placeholder="Search RFID UID..."
+                        placeholder="Search UID or cardholder..."
                         oninput="renderLogs()"
                     >
 
@@ -218,6 +218,7 @@
                             <tr>
                                 <th>SCAN ID</th>
                                 <th>RFID UID</th>
+                                <th>CARDHOLDER</th>
                                 <th>ACCESS STATUS</th>
                                 <th>DATE & TIME</th>
                             </tr>
@@ -227,7 +228,7 @@
                         <tbody id="logs-table">
 
                             <tr>
-                                <td colspan="4" class="empty-state">
+                                <td colspan="5" class="empty-state">
                                     Loading RFID records...
                                 </td>
                             </tr>
